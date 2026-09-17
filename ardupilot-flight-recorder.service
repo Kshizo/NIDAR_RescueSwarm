@@ -1,0 +1,22 @@
+[Unit]
+Description=Passive ArduPilot manual/PosHold flight recorder
+After=network-online.target
+Wants=network-online.target
+# Both services consume MAVLink bytes from the same physical serial link.  They
+# must never run together: starting this recorder stops the autonomous daemon.
+Conflicts=ardupilot-mission.service
+
+[Service]
+Type=simple
+User=aahswarm
+WorkingDirectory=/home/aahswarm/ardupilot_testing
+Environment=VIRTUAL_ENV=/home/aahswarm/px4_mavsdk_env
+Environment=PATH=/home/aahswarm/px4_mavsdk_env/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/home/aahswarm/ardupilot_testing/start_flight_recorder.sh
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

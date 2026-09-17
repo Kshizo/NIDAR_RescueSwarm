@@ -1,0 +1,5 @@
+# ArduPilot companion-computer mission daemon.
+# The project talks MAVLink directly via pymavlink; the PX4/MAVSDK stack
+# (mavsdk, grpcio, protobuf) is no longer imported anywhere and was removed.
+pymavlink==2.4.49
+pyserial==3.5
