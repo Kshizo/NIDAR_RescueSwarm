@@ -5,14 +5,6 @@ __pycache__/
 # Flight video recordings (large binaries)
 recordings/
 
-# Raw flight-controller telemetry logs
-flight_logs/
-*.tlog
-
-# Runtime logs
-*.log
-*.log.[0-9]
-
 # Local env
 .venv/
 venv/
