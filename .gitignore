@@ -2,8 +2,11 @@
 __pycache__/
 *.py[cod]
 
-# Flight video recordings (large binaries)
-recordings/
+# Videos over GitHub's 100 MB limit (need Git LFS)
+recordings/flight_2026-08-20_18-48-26.mkv
+recordings/flight_2026-08-20_18-51-10.mkv
+recordings/flight_2026-08-20_18-54-29.mkv
+recordings/flight_2026-08-20_18-56-21.mkv
 
 # Local env
 .venv/
