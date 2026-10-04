@@ -37,11 +37,11 @@ StartLimitBurst=0
 [Service]
 Type=simple
 User=aahswarm
-WorkingDirectory=/home/aahswarm/ardupilotPatterenTest
+WorkingDirectory=/home/aahswarm/ardupilotRasterFix
 Environment=VIRTUAL_ENV=/home/aahswarm/px4_mavsdk_env
 Environment=PATH=/home/aahswarm/px4_mavsdk_env/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/home/aahswarm/ardupilotPatterenTest/start_ardupilot_raster_mission.sh
+ExecStart=/home/aahswarm/ardupilotRasterFix/start_ardupilot_raster_mission.sh
 # Restart=always, not on-failure.  The daemon's own loop already survives a lost
 # link, a missing /dev/ttyACM*, and an FC power-cycle (it re-resolves the port
 # every attempt), so any exit at all means something unexpected ended it - a

@@ -94,6 +94,11 @@ R_EARTH_M = 6378137.0                  # WGS-84 semi-major axis
 # pattern is tight and slow: 0.40 m between passes, 0.20 m inset from every edge,
 # 0.20 m/s along the passes.
 RASTER_PASS_SPACING_M = float(os.getenv("RASTER_PASS_SPACING_M", "0.40"))
+
+# Which side of the polygon the passes run along. See resolve_sweep_axis().
+# "long" reproduces the original A->B behaviour whenever AB is the longer side,
+# which it is for every area flown so far.
+RASTER_AXIS = os.getenv("RASTER_AXIS", "long")
 # EDGE_INSET_M is the documented name; RASTER_EDGE_INSET_M is kept as an alias.
 EDGE_INSET_M = float(os.getenv("EDGE_INSET_M", os.getenv("RASTER_EDGE_INSET_M", "0.20")))
 RASTER_SPEED_MPS = float(os.getenv("RASTER_SPEED_MPS", "0.20"))
@@ -144,10 +149,18 @@ GEOJSON_OUTPUT = os.getenv("RASTER_GEOJSON", "raster_preview.geojson")
 #
 # Earlier areas are retired: the ~40 m^2 first area, the ~2.56 m^2 3 m x 3 m
 # area, the ~56.8 m^2 4.7 x 13.4 m area, and the 43.6 m^2 area above.
+# 2026-09-17: corners B and C pulled 1.0 m further into the plot at the pilot's
+# request, which retracts the narrow BC end of the area. B moved 1.01 m, C moved
+# 1.03 m, both perpendicular to the BC edge, so the AB and CD sides stay straight
+# and the corner angles barely move (B 98.6 -> 98.1 deg, C 87.7 -> 88.2 deg).
+# Area 99.90 -> 96.03 m^2; AB 20.30 -> 19.29 m; CD 21.05 -> 20.03 m.
+# Previous values, if this needs reverting:
+#     B (13.345712, 74.794043)
+#     C (13.345703, 74.794010)
 DEFAULT_CORNERS = (
     (13.345893, 74.794020),
-    (13.345712, 74.794043),
-    (13.345703, 74.794010),
+    (13.345721, 74.794042),
+    (13.345712, 74.794008),
     (13.345887, 74.793965),
 )
 
@@ -251,6 +264,8 @@ class RasterPlan:
     speed_mps: float
     measurements: dict = field(default_factory=dict)
     dropped_passes: list = field(default_factory=list)
+    axis: str = "long"
+    axis_description: str = ""
 
     @property
     def pass_count(self) -> int:
@@ -288,14 +303,28 @@ def ne_to_gps(north_m: float, east_m: float, ref: GpsPoint) -> tuple:
 # ---------------------------------------------------------------------------
 # Sweep/step frame
 # ---------------------------------------------------------------------------
-def build_frame(a: NePoint, b: NePoint, d: NePoint):
+def build_frame(a: NePoint, b: NePoint, d: NePoint, sweep_across: bool = False):
     """
-    Orthonormal (u, v) frame: u along A->B (sweep), v perpendicular, toward D (step).
+    Orthonormal (u, v) frame: u is the sweep axis, v the step axis.
+
+    By default u runs along A->B and v perpendicular to it, toward D.
 
     v is a rotation of u, NOT a normalisation of A->D. If A->D is not exactly
     perpendicular to A->B — and hand-picked corners never are — using A->D
     directly would give a sheared frame in which "parallel passes" and "spacing
     in metres" stop meaning what they say.
+
+    ``sweep_across=True`` rotates the whole frame a quarter turn so the passes run
+    along A->D instead of A->B (see RASTER_AXIS). The rotation is
+    ``u' = v, v' = -u``, which is a proper rotation with determinant +1. That
+    matters: ``validate_polygon`` requires ``signed_area(polygon_uv) > 0`` and
+    ``edge_halfplanes`` assumes counter-clockwise winding, and only a
+    handedness-preserving transform keeps both true. Swapping u and v instead
+    (determinant -1) would mirror the polygon and reject every valid area.
+
+    After the rotation v' points from B back toward A, so the polygon occupies
+    NEGATIVE v'. Nothing downstream assumes a sign: the pass lines are laid out
+    between the measured v_min and v_max of the inset polygon.
     """
     un, ue = b.north - a.north, b.east - a.east
     length = math.hypot(un, ue)
@@ -306,7 +335,51 @@ def build_frame(a: NePoint, b: NePoint, d: NePoint):
     vn, ve = -ue, un                      # rotate +90 degrees in the (north, east) plane
     if (d.north - a.north) * vn + (d.east - a.east) * ve < 0.0:
         vn, ve = -vn, -ve                 # orient toward D
+
+    if sweep_across:
+        (un, ue), (vn, ve) = (vn, ve), (-un, -ue)
     return (un, ue), (vn, ve)
+
+
+def resolve_sweep_axis(a: NePoint, b: NePoint, d: NePoint, axis: str):
+    """
+    Turns a RASTER_AXIS setting into ``(sweep_across, description)``.
+
+        "ab"    passes run A->B                       (the original behaviour)
+        "ad"    passes run A->D
+        "long"  passes run along whichever of the two is LONGER  (fewest turns,
+                the most efficient coverage, and the default)
+        "short" passes run along the SHORTER side, so there are many short passes
+                instead of few long ones
+
+    "short" exists because pass length sets how long the aircraft spends flying in
+    one direction before it turns, and that is what an observer on the ground
+    reads as "is this a raster or is it just flying away?". On a 20 m x 6 m plot,
+    "long" gives 6 passes of 20 m — 40 s per leg at 0.5 m/s — while "short" gives
+    21 passes of 6 m and turns every 12 s.
+    """
+    key = (axis or "long").strip().lower()
+    ab = math.hypot(b.north - a.north, b.east - a.east)
+    ad = math.hypot(d.north - a.north, d.east - a.east)
+
+    if key == "ab":
+        across = False
+    elif key == "ad":
+        across = True
+    elif key == "long":
+        across = ad > ab
+    elif key == "short":
+        across = ad <= ab
+    else:
+        raise PlanError(
+            f"RASTER_AXIS={axis!r} is not a recognised sweep axis",
+            ["expected one of: long, short, ab, ad"],
+        )
+
+    along = "A->D" if across else "A->B"
+    length = ad if across else ab
+    other = ab if across else ad
+    return across, (f"{along} ({length:.2f}m side, stepping across the {other:.2f}m side)")
 
 
 def to_uv(point: NePoint, origin: NePoint, u_hat, v_hat) -> tuple:
@@ -554,16 +627,22 @@ def validate_polygon(poly_uv, m: dict, spacing_m: float, inset_m: float):
 # Planning
 # ---------------------------------------------------------------------------
 def plan_raster(corner_latlon, spacing_m: float = None, inset_m: float = None,
-                speed_mps: float = None) -> RasterPlan:
+                speed_mps: float = None, axis: str = None) -> RasterPlan:
     """
     Builds the raster plan for four GPS corners in perimeter order.
 
     Raises PlanError with a populated ``problems`` list if the area or the
     parameters cannot produce a safe path. Never returns a partial plan.
+
+    ``axis`` selects which side the passes run along (RASTER_AXIS); see
+    resolve_sweep_axis(). The plan stays anchor-independent either way — it is
+    pure geometry relative to corner A, so it is built and verified on the ground
+    before the flight controller is contacted.
     """
     spacing_m = RASTER_PASS_SPACING_M if spacing_m is None else spacing_m
     inset_m = EDGE_INSET_M if inset_m is None else inset_m
     speed_mps = RASTER_SPEED_MPS if speed_mps is None else speed_mps
+    axis = RASTER_AXIS if axis is None else axis
 
     if len(corner_latlon) != 4:
         raise PlanError(f"exactly 4 corners are required (got {len(corner_latlon)})")
@@ -572,7 +651,9 @@ def plan_raster(corner_latlon, spacing_m: float = None, inset_m: float = None,
     reference = corners[0]
     corner_ne = tuple(gps_to_ne(corner, reference) for corner in corners)
 
-    u_hat, v_hat = build_frame(corner_ne[0], corner_ne[1], corner_ne[3])
+    sweep_across, axis_description = resolve_sweep_axis(
+        corner_ne[0], corner_ne[1], corner_ne[3], axis)
+    u_hat, v_hat = build_frame(corner_ne[0], corner_ne[1], corner_ne[3], sweep_across)
     polygon_uv = tuple(to_uv(point, corner_ne[0], u_hat, v_hat) for point in corner_ne)
     m = measure_polygon(polygon_uv)
 
@@ -623,7 +704,12 @@ def plan_raster(corner_latlon, spacing_m: float = None, inset_m: float = None,
 
         forward = (pass_number % 2 == 0)
         start_u, end_u = (u_lo, u_hi) if forward else (u_hi, u_lo)
-        direction = "A->B" if forward else "B->A"
+        # Names the direction along the SWEEP axis, which is A->B only when the
+        # passes run along AB. With RASTER_AXIS=short on a wide plot they run
+        # along AD instead, and calling that "A->B" in the log would be a lie.
+        low_name, high_name = ("A", "D") if sweep_across else ("A", "B")
+        direction = (f"{low_name}->{high_name}" if forward
+                     else f"{high_name}->{low_name}")
         pass_number += 1
 
         if previous_end is not None:
@@ -662,6 +748,7 @@ def plan_raster(corner_latlon, spacing_m: float = None, inset_m: float = None,
         waypoints=waypoints, segments=segments,
         pass_spacing_requested_m=spacing_m, pass_spacing_actual_m=actual_spacing,
         inset_m=inset_m, speed_mps=speed_mps, measurements=m, dropped_passes=dropped,
+        axis=axis, axis_description=axis_description,
     )
 
 
@@ -1244,7 +1331,14 @@ def ascii_plot(plan: RasterPlan, cols=68, rows=26):
         put(point[0], point[1], label)
 
     print("  ':' mission polygon   '.' inset polygon   digits = pass number   '|' transition")
-    print("  (u = sweep axis A->B rightward, v = step axis A->D upward; not to scale)")
+    # The sweep axis is A->B only when RASTER_AXIS leaves it there; with the
+    # short sweep it runs A->D and the step axis runs A->B, so take both names
+    # from the plan rather than hardcoding them.
+    sweep_name = (plan.axis_description.split(" ")[0]
+                  if plan.axis_description else "A->B")
+    step_name = "A->B" if sweep_name != "A->B" else "A->D"
+    print(f"  (u = sweep axis {sweep_name} rightward, v = step axis {step_name} upward; "
+          "not to scale)")
     for row in grid:
         print("  |" + "".join(row).rstrip())
 

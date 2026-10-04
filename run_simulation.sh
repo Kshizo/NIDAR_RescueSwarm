@@ -320,24 +320,59 @@ check() { # check <label> <logfile> <expect|reject> <pattern>
 # RASTER FLIGHT TESTS
 # ===========================================================================
 # Simulated takeoff positions, all computed from the two configured polygons
-# rather than hand-picked, and all re-derivable with raster_plan_preview:
+# rather than hand-picked, and all re-derivable with raster_plan_preview.
 #
-#   INSIDE_BOTH    inner centroid          outer +3.90 m, inner +2.14 m
-#   OUTSIDE_INNER  outside the survey area outer +3.08 m, inner -0.62 m
-#   OUTSIDE_OUTER  outside the geofence    outer -3.04 m
-#   IN_MARGIN      inside the 0.50 m band  outer +0.39 m
-INSIDE_BOTH=(SIM_HOME_LAT=13.3458462 SIM_HOME_LON=74.7940208)
-OUTSIDE_INNER=(SIM_HOME_LAT=13.3458948 SIM_HOME_LON=74.7940342)
-OUTSIDE_OUTER=(SIM_HOME_LAT=13.3459545 SIM_HOME_LON=74.7940331)
-IN_MARGIN=(SIM_HOME_LAT=13.3459231 SIM_HOME_LON=74.7940331)
+# RE-DERIVED 2026-09-17 for the CURRENT 99.90 m^2 area.
+#
+# These four positions were last computed against the retired 56.8 m^2 inner
+# polygon and its 204.26 m^2 outer geofence. Both were replaced on 2026-09-15
+# (inner -> 99.90 m^2, outer -> 217.93 m^2) and the fixtures were not moved with
+# them, so every one of them had drifted off the boundary it was chosen to sit
+# on. Measured against the polygons actually configured today:
+#
+#                    intended            was documented      actually measured
+#   INSIDE_BOTH      inside both         outer +3.90 m       outer +3.94 m  (ok)
+#   OUTSIDE_INNER    outside inner only  outer +3.08 m       outer +0.44 m  <- REFUSED
+#   OUTSIDE_OUTER    outside outer       outer -3.04 m       outer -4.63 m  (still outside)
+#   IN_MARGIN        in the 0.50 m band  outer +0.39 m       outer -1.15 m  <- fully outside
+#
+# OUTSIDE_INNER landed inside the 0.50 m outer safety margin, so TEST 2 — which
+# asserts the mission is ALLOWED from there — was refused at the origin check.
+# IN_MARGIN fell outside the outer polygon entirely, so TEST 4 was passing for the
+# wrong reason: it tests the margin band, not an outright outside position.
+#
+# Re-derived values, and what they measure now:
+#
+#   INSIDE_BOTH    inner centroid          outer +4.43 m, inner +2.44 m
+#   OUTSIDE_INNER  outside the survey area outer +1.03 m, inner -1.02 m
+#   OUTSIDE_OUTER  outside the geofence    outer -3.00 m, inner -5.02 m
+#   IN_MARGIN      inside the 0.50 m band  outer +0.35 m, inner -1.68 m
+#
+# Re-derive after ANY change to DEFAULT_CORNERS or DEFAULT_OUTER_CORNERS:
+#   python test_simulation_fixtures.py
+INSIDE_BOTH=(SIM_HOME_LAT=13.3458059 SIM_HOME_LON=74.7940080)
+OUTSIDE_INNER=(SIM_HOME_LAT=13.3456940 SIM_HOME_LON=74.7940120)
+OUTSIDE_OUTER=(SIM_HOME_LAT=13.3456660 SIM_HOME_LON=74.7940460)
+IN_MARGIN=(SIM_HOME_LAT=13.3459060 SIM_HOME_LON=74.7940000)
 
 # Flight-test fixture. The CONFIGURED mission is 0.40 m spacing, which on this
-# 56.8 m^2 area is 33 passes / 140 m / ~700 s of raster alone and is refused by
+# 96.03 m^2 area is 14 passes / 232.4 m / ~465 s of raster alone and is refused by
 # the time-budget gate (that refusal is TEST 0). These tests are about the phase
 # machine and the two boundaries, not about coverage density, so they run a
-# coarser 5.0 m spacing — 3 passes, 20.3 m — with a budget to match. Both are
-# explicit fixtures, not changes to the shipped configuration.
-FLIGHT_FIXTURE=(RASTER_PASS_SPACING_M=5.0 RASTER_TOTAL_TIMEOUT_S=400)
+# coarser spacing with a budget to match. Both are explicit fixtures, not changes
+# to the shipped configuration.
+#
+# 2026-09-17: was 5.0 m, which gave 3 passes on the old area but only 2 on this
+# one, so every "All 3 passes complete" assertion below was checking a string the
+# daemon could not print. 2.0 m gives 3 passes / 52.6 m here.
+#
+# RASTER_SPEED_MPS is now pinned too. It was inherited from the module default of
+# 0.20 m/s, which on the old 20.3 m pattern fitted the 400 s budget and on this
+# 52.6 m one does not: ~73 m of route at 0.20 m/s is 493 s expected against the
+# 400 s ceiling, so every flight test would be refused by the budget gate before
+# it moved. 0.50 m/s is what start_ardupilot_raster_mission.sh actually flies, so
+# the tests now exercise the shipped speed: ~197 s, comfortably inside 400 s.
+FLIGHT_FIXTURE=(RASTER_PASS_SPACING_M=2.0 RASTER_SPEED_MPS=0.50 RASTER_TOTAL_TIMEOUT_S=400)
 
 run_budget() {
   echo "[TEST 0 budget] the CONFIGURED 0.40 m spacing must be refused on the ground"
@@ -346,9 +381,9 @@ run_budget() {
   local log
   log=$(raster_scenario budget 10 45 'sleep 6; touch "$WORK/TRIGGER_budget"')
   check "planned the polygon"                    "$log" expect "POLYGON RASTER MISSION PLAN"
-  check "33 passes at 0.40 m spacing"            "$log" expect "Passes: 33"
+  check "14 passes at 0.40 m spacing"            "$log" expect "Passes: 14"
   check "refused on the time budget"             "$log" expect "RASTER BUDGET. REFUSING TO FLY"
-  check "named the pattern as the driver"        "$log" expect "What drives it: 140\.[0-9]m of pattern"
+  check "named the pattern as the driver"        "$log" expect "What drives it: 232\.[0-9]m of pattern"
   check "refused to adjust anything itself"      "$log" expect "Nothing is adjusted automatically"
   check "never started the transit"              "$log" reject "RASTER PHASE. TRANSIT_TO_RASTER"
   check "never flew a pass"                      "$log" reject "pass 1/"
@@ -362,8 +397,8 @@ run_normal() {
   SIM_ENV=("${INSIDE_BOTH[@]}")
   local log
   log=$(raster_scenario normal 11 300 'sleep 6; touch "$WORK/TRIGGER_normal"')
-  check "validated the outer geofence"           "$log" expect "Outer safety geofence: area 204\."
-  check "confirmed inner inside outer"           "$log" expect "Inner inside outer: minimum separation 1\.5"
+  check "validated the outer geofence"           "$log" expect "Outer safety geofence: area 217\."
+  check "confirmed inner inside outer"           "$log" expect "Inner inside outer: minimum separation 1\.9"
   check "did not refuse to start"                "$log" reject "REFUSING TO START"
   check "took off to the 2.0 m target"           "$log" expect "target 2\.0m|target 2\.0 m"
   check "held the mission altitude"              "$log" expect "Target altitude reached and stable"
@@ -450,13 +485,19 @@ run_transitouter() {
   # 0.6 m/s against a 0.20 m/s cap: the aircraft cannot make headway and is
   # carried steadily outward. The inner allowance is opened to 20 m so boundary 1
   # cannot fire first and mask boundary 2 — a fixture, not a flight setting.
-  RASTER_ENV=("${FLIGHT_FIXTURE[@]}" RASTER_POLYGON_BREACH_MARGIN_M=20.0)
+  # 2026-09-17: dropped RASTER_POLYGON_BREACH_MARGIN_M=20.0.  The inner polygon is
+  # only enforced during the RASTER phase (POLYGON_ENFORCED_PHASES), so it is
+  # already inactive on this leg and never needed widening.  Worse, 20.0 m made
+  # check_boundary_separation refuse the mission outright before it moved
+  # (1.96 - 0.50 - 20.0 < 0), so this scenario could not run at all.
+  RASTER_ENV=("${FLIGHT_FIXTURE[@]}")
   SIM_ENV=("${INSIDE_BOTH[@]}" SIM_DRIFT_E_MPS=0.6)
   local log
   log=$(raster_scenario transitouter 15 200 \
         'echo 1 > "$WORK/drift_transitouter"; sleep 6; touch "$WORK/TRIGGER_transitouter"')
   check "entered the transit phase"              "$log" expect "RASTER PHASE. TRANSIT_TO_RASTER"
-  check "inner layer deliberately widened"       "$log" expect "excursion 20\.00m"
+  check "layers are independent"                 "$log" reject "RASTER BOUNDARY. REFUSING TO FLY"
+  check "inner layer inactive on this leg"       "$log" expect "containment is not enforced"
   check "inner layer did NOT fire"               "$log" reject "RASTER POLYGON BREACH"
   check "detected the outer breach"              "$log" expect "OUTER GEOFENCE BREACH"
   check "stopped horizontal motion"              "$log" expect "Horizontal motion stopped"
@@ -486,8 +527,17 @@ run_rasterinner() {
 }
 
 run_rasterouter() {
-  echo "[TEST 7 rasterouter] aircraft leaves the OUTER polygon during RASTER"
-  RASTER_ENV=("${FLIGHT_FIXTURE[@]}" RASTER_POLYGON_BREACH_MARGIN_M=20.0)
+  echo "[TEST 7 rasterouter] during RASTER the INNER layer must fire before the OUTER one"
+  # 2026-09-17 REFRAMED.  This used to widen the inner tolerance to 20.0 m so the
+  # outer layer would be the one to fire.  Two problems: check_boundary_separation
+  # refuses any mission where the inner tolerance and the outer margin overlap, so
+  # 20.0 m meant the scenario never flew; and the state it was reaching for is
+  # unreachable by design.  The inner polygon sits 1.96 m inside the outer, the
+  # enforced outer boundary is 0.50 m in from that, and the inner breach tolerance
+  # is 0.50 m - so the inner limit is always 1.46 m closer than the outer one.
+  # Drift during RASTER must therefore ALWAYS be caught by the inner layer.
+  # That ordering is the safety property worth testing, so this now tests it.
+  RASTER_ENV=("${FLIGHT_FIXTURE[@]}")
   SIM_ENV=("${INSIDE_BOTH[@]}" SIM_DRIFT_E_MPS=0.5)
   local log
   log=$(raster_scenario rasterouter 17 240 \
@@ -495,9 +545,9 @@ run_rasterouter() {
          wait_for "$WORK/rasterouter.log" "containment is now ENFORCED" 150;
          echo 1 > "$WORK/drift_rasterouter"')
   check "reached the raster phase"               "$log" expect "polygon containment is now ENFORCED"
-  check "inner layer deliberately widened"       "$log" expect "excursion 20\.00m"
-  check "inner layer did NOT fire"               "$log" reject "RASTER POLYGON BREACH"
-  check "detected the outer breach"              "$log" expect "OUTER GEOFENCE BREACH"
+  check "layers are independent"                 "$log" reject "RASTER BOUNDARY. REFUSING TO FLY"
+  check "INNER layer caught the drift"           "$log" expect "RASTER POLYGON BREACH"
+  check "OUTER layer never had to fire"          "$log" reject "OUTER GEOFENCE BREACH"
   check "stopped horizontal motion"              "$log" expect "Horizontal motion stopped"
   check "invoked the senior safety landing"      "$log" expect "EXECUTING SAFETY LAND"
   check "did NOT complete the pattern"           "$log" reject "All 3 passes complete"
@@ -506,7 +556,12 @@ run_rasterouter() {
 
 run_returnouter() {
   echo "[TEST 9 returnouter] wind carries it across the OUTER polygon during RETURN"
-  RASTER_ENV=("${FLIGHT_FIXTURE[@]}" RASTER_POLYGON_BREACH_MARGIN_M=20.0)
+  # 2026-09-17: dropped RASTER_POLYGON_BREACH_MARGIN_M=20.0.  The inner polygon is
+  # only enforced during the RASTER phase (POLYGON_ENFORCED_PHASES), so it is
+  # already inactive on this leg and never needed widening.  Worse, 20.0 m made
+  # check_boundary_separation refuse the mission outright before it moved
+  # (1.96 - 0.50 - 20.0 < 0), so this scenario could not run at all.
+  RASTER_ENV=("${FLIGHT_FIXTURE[@]}")
   SIM_ENV=("${INSIDE_BOTH[@]}" SIM_DRIFT_E_MPS=0.6)
   local log
   log=$(raster_scenario returnouter 18 300 \
@@ -516,6 +571,8 @@ run_returnouter() {
   check "completed the pattern first"            "$log" expect "All 3 passes complete"
   check "reached the return phase"               "$log" expect "RASTER PHASE. RETURN_TO_ORIGIN"
   check "inner released for the return"          "$log" expect "containment released"
+  check "layers are independent"                 "$log" reject "RASTER BOUNDARY. REFUSING TO FLY"
+  check "inner layer did NOT fire"               "$log" reject "RASTER POLYGON BREACH"
   check "detected the outer breach"              "$log" expect "OUTER GEOFENCE BREACH"
   check "stopped horizontal motion"              "$log" expect "Horizontal motion stopped"
   check "invoked the senior safety landing"      "$log" expect "EXECUTING SAFETY LAND"
@@ -783,7 +840,7 @@ run_dry1() {
   # OUTER
   check "projected the outer geofence"     "$log" expect "OUTER SAFETY GEOFENCE IN THE REAL"
   check "listed G1-G4"                     "$log" expect "G4 +13\."
-  check "outer area"                       "$log" expect "area +: 204\.[0-9]+ m\^2"
+  check "outer area"                       "$log" expect "area +: 217\.[0-9]+ m\^2"
   check "outer side lengths"               "$log" expect "side lengths +: G1G2="
   check "outer winding"                    "$log" expect "winding \(as stored\)"
   check "effective 0.50 m boundary"        "$log" expect "inward safety margin : 0\.50 m"
@@ -937,7 +994,7 @@ run_dry9() {
   check "reported 33 passes"                "$log" expect "raster passes +: 33"
   check "reported the time budget"          "$log" expect "TIME BUDGET"
   check "failed on the budget"              "$log" expect "cannot finish inside the"
-  check "named the driver"                  "$log" expect "Driver: 140\."
+  check "named the driver"                  "$log" expect "Driver: 232\."
   check "refused to adjust anything"        "$log" expect "Nothing is adjusted automatically"
   check "overall FAIL"                      "$log" expect "RASTER DRY RUN: FAIL"
   check "no exceptions"                     "$log" reject "Traceback"

@@ -134,6 +134,12 @@ OUTER_CORNERS = _parse_corners(_outer_env) if _outer_env else DEFAULT_OUTER_CORN
 
 # Small first-test values, matching raster_plan_preview.
 RASTER_PASS_SPACING_M = float(os.getenv("RASTER_PASS_SPACING_M", "0.40"))
+
+# Which side the passes run along: long | short | ab | ad. "long" keeps the
+# original A->B sweep on every area flown so far. "short" turns a few long passes
+# into many short ones, which is far easier to recognise as a raster from the
+# ground — see resolve_sweep_axis() in raster_plan_preview.py.
+RASTER_AXIS = os.getenv("RASTER_AXIS", "long")
 RASTER_EDGE_INSET_M = float(os.getenv("EDGE_INSET_M", os.getenv("RASTER_EDGE_INSET_M", "0.20")))
 RASTER_SPEED_MPS = float(os.getenv("RASTER_SPEED_MPS", "0.20"))
 
@@ -148,7 +154,27 @@ RASTER_WAYPOINT_TOLERANCE_M = float(os.getenv("RASTER_WAYPOINT_TOLERANCE_M", "0.
 RASTER_FINAL_TOLERANCE_M = float(os.getenv("RASTER_FINAL_TOLERANCE_M",
                                            str(mission.LOCAL_POSITION_TOLERANCE_M)))
 
+# Corner settling (2026-10-04). The 2026-10-02 16:08 flight at 1.0 m/s held the
+# middle of every leg to <=0.27 m but swung 0.4-0.85 m off line at the corners:
+# a leg ended the instant the aircraft entered the 0.20 m radius, while it was
+# still moving, and the next leg's 90-degree command pulled it sideways while its
+# momentum carried it on. A leg now ends only once ground speed has dropped
+# below RASTER_SETTLE_SPEED_MPS while inside the radius. If that has not happened
+# within RASTER_SETTLE_TIMEOUT_S the pattern carries on (the aircraft is on the
+# point; a gust should not land it), and the log says so.
+RASTER_SETTLE_SPEED_MPS = float(os.getenv("RASTER_SETTLE_SPEED_MPS", "0.10"))
+RASTER_SETTLE_TIMEOUT_S = float(os.getenv("RASTER_SETTLE_TIMEOUT_S", "4.0"))
+# Pull-back speed cap while settling: enough to recover an overshoot, too low to
+# start a new swing.
+RASTER_SETTLE_MAX_SPEED_MPS = 0.30
+
 # Anchor quality gates.
+# How often a leg in progress reports itself. The 2026-09-15 flight logged
+# "-> WP01" and then nothing at all for the 35 s until the pilot took over: a 20 m
+# pass at 0.50 m/s is 40 s, so the whole leg fitted between two log lines and
+# there was no way to tell a correctly tracking aircraft from a stuck one.
+RASTER_PROGRESS_INTERVAL_S = float(os.getenv("RASTER_PROGRESS_INTERVAL_S", "3.0"))
+
 RASTER_GPS_MAX_AGE_S = float(os.getenv("RASTER_GPS_MAX_AGE_S", "1.0"))
 RASTER_ANCHOR_MAX_SKEW_S = float(os.getenv("RASTER_ANCHOR_MAX_SKEW_S", "0.35"))
 RASTER_MIN_GPS_FIX_TYPE = int(os.getenv("RASTER_MIN_GPS_FIX_TYPE", "3"))
@@ -438,7 +464,8 @@ def build_plan():
         raise planner.PlanError("the outer safety geofence is not usable", outer_problems)
 
     plan = planner.plan_raster(RASTER_CORNERS, RASTER_PASS_SPACING_M,
-                               RASTER_EDGE_INSET_M, RASTER_SPEED_MPS)
+                               RASTER_EDGE_INSET_M, RASTER_SPEED_MPS,
+                               RASTER_AXIS)
     problems, metrics = planner.verify_containment(plan)
     if problems:
         raise planner.PlanError("the generated raster path is not contained by the "
@@ -468,10 +495,17 @@ def log_plan(plan, metrics):
         f"C={m['angle_c']:.1f} D={m['angle_d']:.1f} deg (a rectangle is not required)")
     log(f"  Inward safety inset: {plan.inset_m:.2f}m -> inset area "
         f"{abs(planner.signed_area(plan.inset_uv)):.2f}m^2")
-    log(f"  Raster direction: A->B, bearing "
-        f"{math.degrees(math.atan2(plan.u_hat[1], plan.u_hat[0])) % 360.0:.1f} deg, alternating")
+    log(f"  Sweep axis: RASTER_AXIS={plan.axis} -> passes run {plan.axis_description}, "
+        f"bearing {math.degrees(math.atan2(plan.u_hat[1], plan.u_hat[0])) % 360.0:.1f} deg, "
+        "alternating")
     log(f"  Passes: {plan.pass_count}, spacing {plan.pass_spacing_actual_m:.3f}m "
         f"(requested {plan.pass_spacing_requested_m:.3f}m), waypoints {len(plan.waypoints)}")
+    pass_lengths = [seg.length_m for seg in plan.segments if seg.kind == "pass"]
+    if pass_lengths:
+        longest = max(pass_lengths)
+        log(f"  Pass lengths: {min(pass_lengths):.2f}m to {longest:.2f}m; the longest "
+            f"leg is {longest / plan.speed_mps:.0f}s at {plan.speed_mps:.2f}m/s, which is "
+            "how long the aircraft flies in one direction before its first turn")
     log(f"  Path length {plan.path_length_m:.1f}m, estimated "
         f"{plan.estimated_time_s:.0f}s at {plan.speed_mps:.2f}m/s "
         f"(horizontal travel only)")
@@ -894,10 +928,60 @@ def raster_safety_check(master, state, boundary, outer, context, phase):
     return True
 
 
+def settle_at_point(master, state, north_m, east_m, tolerance_m, context, phase,
+                    boundary=None, outer=None):
+    """
+    Holds the aircraft on a reached waypoint until its ground speed is below
+    RASTER_SETTLE_SPEED_MPS, so the following leg starts from rest instead of
+    turning with momentum still carrying it along the old direction.
+
+    Keeps streaming setpoints and running ``raster_safety_check`` every iteration.
+    Returns False only if a safety check fails; a settle timeout is logged and
+    returns True.
+    """
+    interval = 1.0 / mission.STREAM_HZ
+    started_at = time.monotonic()
+    end_time = started_at + RASTER_SETTLE_TIMEOUT_S
+
+    while True:
+        if not raster_safety_check(master, state, boundary, outer, context, phase):
+            return False
+
+        error_north = north_m - state.local_north_m
+        error_east = east_m - state.local_east_m
+        distance = math.hypot(error_north, error_east)
+        ground_speed = math.hypot(state.vx, state.vy)
+        if ground_speed <= RASTER_SETTLE_SPEED_MPS and distance <= tolerance_m:
+            mission.send_local_ned_velocity(master, 0.0, 0.0, 0.0)
+            return True
+
+        if time.monotonic() >= end_time:
+            mission.send_local_ned_velocity(master, 0.0, 0.0, 0.0)
+            mission.logger.warning(
+                f"[RASTER SETTLE] {context}: still {ground_speed:.2f}m/s and "
+                f"{distance:.2f}m off the point after {RASTER_SETTLE_TIMEOUT_S:.1f}s; "
+                "continuing to the next leg.")
+            return True
+
+        # Same proportional law as goto_point, capped low: pulls an overshoot
+        # back onto the point and lets ArduPilot brake the residual velocity.
+        if distance > 0.02:
+            pull = min(RASTER_SETTLE_MAX_SPEED_MPS, 0.8 * distance)
+            mission.send_local_ned_velocity(master, pull * error_north / distance,
+                                            pull * error_east / distance, 0.0)
+        else:
+            mission.send_local_ned_velocity(master, 0.0, 0.0, 0.0)
+        time.sleep(interval)
+
+
 def goto_point(master, state, north_m, east_m, tolerance_m, context, phase,
-               boundary=None, outer=None, speed_mps=None):
+               boundary=None, outer=None, speed_mps=None, settle=True):
     """
     Flies to one local-NED point, running the base geofence check every iteration.
+
+    With ``settle`` (the default) the leg does not end on reaching the acceptance
+    radius: ``settle_at_point`` holds the aircraft on the point until it has
+    actually stopped, so the next leg starts from rest. See RASTER_SETTLE_SPEED_MPS.
 
     Why this does not simply call ``mission.move_to_local_ned_point``:
         that function derives its timeout from the distance between the TARGET and
@@ -916,9 +1000,21 @@ def goto_point(master, state, north_m, east_m, tolerance_m, context, phase,
     """
     speed_mps = RASTER_SPEED_MPS if speed_mps is None else speed_mps
     interval = 1.0 / mission.STREAM_HZ
-    start_distance = math.hypot(north_m - state.local_north_m, east_m - state.local_east_m)
+    start_north, start_east = state.local_north_m, state.local_east_m
+    start_distance = math.hypot(north_m - start_north, east_m - start_east)
     timeout_s = max(15.0, 3.0 * start_distance / speed_mps)
-    end_time = time.monotonic() + timeout_s
+    started_at = time.monotonic()
+    end_time = started_at + timeout_s
+    next_progress = started_at + RASTER_PROGRESS_INTERVAL_S
+
+    # Unit vector along the leg, for the cross-track term below. A leg shorter
+    # than a millimetre has no meaningful direction, so cross-track is suppressed
+    # rather than computed from noise.
+    if start_distance > 1e-3:
+        leg_north = (north_m - start_north) / start_distance
+        leg_east = (east_m - start_east) / start_distance
+    else:
+        leg_north = leg_east = None
 
     while time.monotonic() < end_time:
         # abort gate -> freshness -> altitude -> outer geofence -> inner polygon
@@ -931,6 +1027,9 @@ def goto_point(master, state, north_m, east_m, tolerance_m, context, phase,
         error_east = east_m - state.local_east_m
         distance = math.hypot(error_north, error_east)
         if distance <= tolerance_m:
+            if settle:
+                return settle_at_point(master, state, north_m, east_m, tolerance_m,
+                                       context, phase, boundary, outer)
             mission.send_local_ned_velocity(master, 0.0, 0.0, 0.0)
             return True
 
@@ -942,6 +1041,37 @@ def goto_point(master, state, north_m, east_m, tolerance_m, context, phase,
                                         travel_speed * error_north / distance,
                                         travel_speed * error_east / distance,
                                         0.0)
+
+        # Periodic progress. Cross-track is measured against the straight line
+        # from where this leg began to its target, so a leg that is tracking
+        # correctly reads near zero and a leg being pushed off by wind does not.
+        now = time.monotonic()
+        if now >= next_progress:
+            next_progress = now + RASTER_PROGRESS_INTERVAL_S
+            travelled = start_distance - distance
+            percent = (100.0 * travelled / start_distance) if start_distance > 1e-6 else 100.0
+            elapsed = now - started_at
+            if leg_north is not None:
+                offset_north = state.local_north_m - start_north
+                offset_east = state.local_east_m - start_east
+                cross_track = abs(offset_north * leg_east - offset_east * leg_north)
+                cross_text = f", cross-track {cross_track:.2f}m"
+            else:
+                cross_text = ""
+            if boundary is not None and phase in POLYGON_ENFORCED_PHASES:
+                edge_text = (f", {boundary.clearance_m(state.local_north_m, state.local_east_m):+.2f}m "
+                             "from the polygon edge")
+            elif outer is not None:
+                edge_text = (f", {outer.clearance_m(state.local_north_m, state.local_east_m):+.2f}m "
+                             "from the outer geofence")
+            else:
+                edge_text = ""
+            mission.logger.info(
+                f"[RASTER PROGRESS] {context}: {percent:5.1f}% ({travelled:.2f}m of "
+                f"{start_distance:.2f}m), {distance:.2f}m to run, {elapsed:.0f}s of "
+                f"{timeout_s:.0f}s, N={state.local_north_m:+.2f}m E={state.local_east_m:+.2f}m"
+                f"{cross_text}{edge_text}")
+
         time.sleep(interval)
 
     short_by = math.hypot(north_m - state.local_north_m, east_m - state.local_east_m)
@@ -950,6 +1080,131 @@ def goto_point(master, state, north_m, east_m, tolerance_m, context, phase,
         f"({short_by:.2f}m short of the target).")
     stop_horizontal(master, "waypoint timeout")
     return False
+
+
+# ---------------------------------------------------------------------------
+# Entry-point selection — which end of the raster to start from
+# ---------------------------------------------------------------------------
+# WHY THIS EXISTS (2026-09-17)
+#
+# The 2026-09-15 20:33 flight took off at local N=+1.76 E=+1.96, INSIDE the
+# mission polygon and about 11 m from corner A. The plan always entered at WP00,
+# the corner-A end of pass 1, so the aircraft:
+#
+#     transit  origin N=+1.76  ->  WP00 N=+13.35      11.6 m NORTH   (23 s)
+#     pass 1   WP00  N=+13.35  ->  WP01 N=-6.50       20.0 m SOUTH   (40 s)
+#
+# Pass 1 ran back down the same line the transit had just come up, straight over
+# the takeoff point. The first 63 seconds of the pattern were therefore one line
+# out and one line back with no turn in between, which is exactly what the pilot
+# saw before taking manual control at 20:34:55 — 35 s into pass 1, still 5 s
+# short of the first turn. The raster was correct; it was unrecognisable.
+#
+# A boustrophedon can be flown from any of FOUR ends and covers identical ground
+# each time, because reversing the pass order or swapping every pass's endpoints
+# both preserve the short end-to-end transitions that make it a continuous path:
+#
+#     1. passes in order,    each pass start -> end     (the original behaviour)
+#     2. passes in order,    each pass end   -> start
+#     3. passes reversed,    each pass end   -> start
+#     4. passes reversed,    each pass start -> end
+#
+# Reversing the order alone would leave the aircraft jumping the full length of a
+# pass between every pair, so the order reversal and the endpoint swap are
+# applied as the coupled pair above, never independently.
+#
+# This picks whichever of the four costs least in transit + return. It changes
+# only the ORDER the planned waypoints are flown in, never their positions, so
+# the containment proof done on the ground in build_plan() still holds. The
+# whole-route outer-geofence check and the time budget run AFTER this, on the
+# order actually chosen.
+# ---------------------------------------------------------------------------
+class FlightWaypoint:
+    """
+    One planned waypoint, renumbered into the order it is actually flown.
+
+    The geometry comes straight from the planner's Waypoint; only the labelling
+    (pass number, start/end role, direction name) is rewritten, because "pass 1"
+    in the log has to mean the first pass the aircraft flies.
+    """
+    __slots__ = ("pass_index", "kind", "direction", "v_m", "u_m", "source")
+
+    def __init__(self, source, pass_index, kind, direction):
+        self.source = source
+        self.pass_index = pass_index
+        self.kind = kind
+        self.direction = direction
+        self.v_m = source.v_m
+        self.u_m = source.u_m
+
+
+def orient_targets_for_origin(plan, targets, origin_north, origin_east):
+    """
+    Reorders ``targets`` so the pattern starts at whichever end is cheapest to
+    reach from the captured origin.
+
+    ``targets`` is the planner's order: ``(label, north_m, east_m, waypoint)``,
+    exactly two entries per pass. Returns ``(reordered_targets, report)``.
+    """
+    pairs = [tuple(targets[i:i + 2]) for i in range(0, len(targets), 2)]
+    if any(len(pair) != 2 for pair in pairs) or not pairs:
+        mission.logger.warning(
+            "[RASTER ENTRY] Unexpected waypoint layout (%d waypoints for %d passes); "
+            "flying the planner's order unchanged." % (len(targets), plan.pass_count))
+        return targets, None
+
+    def cost(sequence):
+        """Transit from the origin to the first point, plus the return from the last."""
+        _, first_n, first_e, _ = sequence[0]
+        _, last_n, last_e, _ = sequence[-1]
+        transit = math.hypot(first_n - origin_north, first_e - origin_east)
+        back = math.hypot(last_n - origin_north, last_e - origin_east)
+        return transit, back, transit + back
+
+    candidates = []
+    for reverse_order, flip_ends, name in (
+        (False, False, "as planned (first pass, start end)"),
+        (False, True, "as planned (first pass, far end)"),
+        (True, True, "reversed (last pass, far end)"),
+        (True, False, "reversed (last pass, start end)"),
+    ):
+        ordered = pairs[::-1] if reverse_order else pairs
+        sequence = []
+        for pair in ordered:
+            sequence.extend(pair[::-1] if flip_ends else pair)
+        transit, back, total = cost(sequence)
+        candidates.append({"name": name, "sequence": sequence, "transit_m": transit,
+                           "return_m": back, "total_m": total})
+
+    baseline = candidates[0]
+    chosen = min(candidates, key=lambda c: c["total_m"])
+
+    # Renumber into flight order so the log describes what the aircraft is doing.
+    renumbered = []
+    for position, (_, north_m, east_m, w) in enumerate(chosen["sequence"]):
+        pass_index = position // 2 + 1
+        kind = "pass_start" if position % 2 == 0 else "pass_end"
+        partner = chosen["sequence"][position + 1 if kind == "pass_start" else position - 1]
+        # Direction along the sweep axis, from the two endpoints actually flown.
+        low, high = (w.u_m, partner[3].u_m) if kind == "pass_start" else (partner[3].u_m, w.u_m)
+        forward = high >= low
+        ends = plan.axis_description.split(" ")[0] if plan.axis_description else "A->B"
+        first, last = (ends.split("->") + ["B"])[:2]
+        direction = f"{first}->{last}" if forward else f"{last}->{first}"
+        label = f"WP{position:02d} (pass {pass_index} {kind})"
+        renumbered.append((label, north_m, east_m,
+                           FlightWaypoint(w, pass_index, kind, direction)))
+
+    report = {
+        "chosen": chosen["name"],
+        "transit_m": chosen["transit_m"],
+        "return_m": chosen["return_m"],
+        "baseline_transit_m": baseline["transit_m"],
+        "baseline_return_m": baseline["return_m"],
+        "saved_m": baseline["total_m"] - chosen["total_m"],
+        "candidates": candidates,
+    }
+    return renumbered, report
 
 
 def fly_raster_pattern(master, state) -> bool:
@@ -1000,10 +1255,49 @@ def fly_raster_pattern(master, state) -> bool:
     for w in plan.waypoints:
         north_m, east_m = anchor.to_local(w.lat, w.lon)
         targets.append((f"WP{w.index:02d} (pass {w.pass_index} {w.kind})", north_m, east_m, w))
-    anchor_offset = math.hypot(targets[0][1] - origin_north, targets[0][2] - origin_east)
     mission.logger.info(
-        f"[RASTER] {len(targets)} waypoints converted into local NED; the first is "
-        f"{anchor_offset:.2f}m from the origin.")
+        f"[RASTER] {len(targets)} waypoints converted into local NED "
+        f"({plan.pass_count} passes along {plan.axis_description or 'A->B'}).")
+
+    # 4a. Choose which of the four ends of the boustrophedon to enter from. This
+    #     only reorders the planned waypoints; it never moves one. See
+    #     orient_targets_for_origin() for why the aircraft used to fly a line out
+    #     and the same line back before its first turn.
+    targets, entry = orient_targets_for_origin(plan, targets, origin_north, origin_east)
+    anchor_offset = math.hypot(targets[0][1] - origin_north, targets[0][2] - origin_east)
+    if entry is not None:
+        mission.logger.info(
+            f"[RASTER ENTRY] Starting from the {entry['chosen']} end: transit "
+            f"{entry['transit_m']:.2f}m + return {entry['return_m']:.2f}m. The "
+            f"planner's own order would have cost {entry['baseline_transit_m']:.2f}m + "
+            f"{entry['baseline_return_m']:.2f}m"
+            + (f" ({entry['saved_m']:.2f}m saved)." if entry["saved_m"] > 0.005
+               else " (no cheaper end available)."))
+        for candidate in entry["candidates"]:
+            mission.logger.info(
+                f"[RASTER ENTRY]     {candidate['name']:<38} transit "
+                f"{candidate['transit_m']:6.2f}m  return {candidate['return_m']:6.2f}m  "
+                f"total {candidate['total_m']:6.2f}m"
+                + ("   <- chosen" if candidate["name"] == entry["chosen"] else ""))
+
+    # 4a-ii. Print the route in flight order before anything moves, so the pilot
+    #        can match what the aircraft does against what was planned. The
+    #        2026-09-15 abort happened because the first two legs looked wrong and
+    #        there was nothing to check them against.
+    mission.logger.info("[RASTER ROUTE] Flight order from the captured origin:")
+    previous = (origin_north, origin_east)
+    cumulative = 0.0
+    for label, north_m, east_m, w in targets:
+        leg = math.hypot(north_m - previous[0], east_m - previous[1])
+        cumulative += leg
+        mission.logger.info(
+            f"[RASTER ROUTE]   {label:<28} N={north_m:+7.2f}m E={east_m:+7.2f}m  "
+            f"leg {leg:5.2f}m  cumulative {cumulative:6.2f}m  dir {w.direction}")
+        previous = (north_m, east_m)
+    cumulative += math.hypot(origin_north - previous[0], origin_east - previous[1])
+    mission.logger.info(
+        f"[RASTER ROUTE]   {'return to origin':<28} N={origin_north:+7.2f}m "
+        f"E={origin_east:+7.2f}m  cumulative {cumulative:6.2f}m")
 
     # 4b. Project BOTH polygons into local NED through the same anchor.
     boundary = build_mission_boundary(plan, anchor)
@@ -1447,21 +1741,40 @@ def _dry_run_geometry(state, plan, metrics, log):
         log(f"    {w.index:3d}  {w.pass_index:4d}  {w.kind:<10}  {n:+8.2f}  {e:+8.2f}       "
             f"{d:8.2f}")
 
-    first_w, first_n, first_e = waypoint_ne[0]
-    last_w, last_n, last_e = waypoint_ne[-1]
+    # Entry selection, exactly as the flight leg does it, so this preview reports
+    # the route that would actually be flown from here rather than the planner's
+    # raw order. Without this the dry run would print a transit the aircraft is
+    # never going to fly.
+    preview_targets = [(f"WP{w.index:02d} (pass {w.pass_index} {w.kind})", n, e, w)
+                       for w, n, e in waypoint_ne]
+    preview_targets, preview_entry = orient_targets_for_origin(
+        plan, preview_targets, ref_n, ref_e)
+    if preview_entry is not None:
+        log("")
+        log("ENTRY POINT FROM THIS POSITION")
+        log(RULE)
+        for candidate in preview_entry["candidates"]:
+            log(f"    {candidate['name']:<38} transit {candidate['transit_m']:6.2f} m  "
+                f"return {candidate['return_m']:6.2f} m  total {candidate['total_m']:6.2f} m"
+                + ("   <- chosen" if candidate["name"] == preview_entry["chosen"] else ""))
+        if preview_entry["saved_m"] > 0.005:
+            log(f"    saves {preview_entry['saved_m']:.2f} m against the planner's own order")
+
+    first_label, first_n, first_e, first_w = preview_targets[0]
+    last_label, last_n, last_e, last_w = preview_targets[-1]
     transit_m = math.hypot(first_n - ref_n, first_e - ref_e)
     return_m = math.hypot(last_n - ref_n, last_e - ref_e)
     log("")
     log("MISSION PHASES FROM THIS POSITION")
     log(RULE)
-    log(f"  1. {PHASE_TRANSIT:<18} origin -> WP{first_w.index:02d}, {transit_m:.2f} m")
+    log(f"  1. {PHASE_TRANSIT:<18} origin -> {first_label}, {transit_m:.2f} m")
     log("     INNER polygon NOT enforced; OUTER geofence, telemetry, EKF,")
     log("     altitude and battery all enforced")
     log(f"  2. {PHASE_RASTER:<18} {plan.pass_count} passes, {plan.path_length_m:.2f} m of path, "
         f"~{plan.estimated_time_s:.0f} s at {plan.speed_mps:.2f} m/s")
     log("     INNER polygon ENFORCED against the ACTUAL aircraft position,")
     log("     OUTER geofence and everything else also enforced")
-    log(f"  3. {PHASE_RETURN:<18} WP{last_w.index:02d} -> origin, {return_m:.2f} m, then the "
+    log(f"  3. {PHASE_RETURN:<18} {last_label} -> origin, {return_m:.2f} m, then the "
         "base soft landing")
     log("     INNER polygon NOT enforced; OUTER geofence and everything else enforced")
 
@@ -1546,8 +1859,10 @@ def _dry_run_geometry(state, plan, metrics, log):
     # Same rules the in-flight pre-checks apply, so a dry-run PASS predicts an
     # in-flight acceptance instead of merely resembling it.
     # ------------------------------------------------------------------
+    # In FLIGHT order (preview_targets), not the planner's order: the route the
+    # outer-geofence check clears has to be the one the aircraft would fly.
     route = [("takeoff/hover origin", ref_n, ref_e)]
-    route.extend((f"WP{w.index:02d}", n, e) for w, n, e in waypoint_ne)
+    route.extend((label, n, e) for label, n, e, _ in preview_targets)
     route.append(("return to origin", ref_n, ref_e))
 
     log("")
