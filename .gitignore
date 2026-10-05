@@ -2,12 +2,22 @@
 __pycache__/
 *.py[cod]
 
-# Videos over GitHub's 100 MB limit (need Git LFS)
-recordings/flight_2026-08-20_18-48-26.mkv
-recordings/flight_2026-08-20_18-51-10.mkv
-recordings/flight_2026-08-20_18-54-29.mkv
-recordings/flight_2026-08-20_18-56-21.mkv
-
 # Local env
 .venv/
 venv/
+
+# Runtime output written by the daemons next to their code.
+# Curated copies of anything worth keeping go in data/.
+mission/*.log
+mission/*.log.[0-9]*
+mission/flight_logs/
+mission/recordings/
+mission/START_*MISSION
+mission/raster_preview.geojson
+*.bak-*
+
+# Videos over GitHub's 100 MB per-file limit (need Git LFS)
+data/recordings/flight_2026-08-20_18-48-26.mkv
+data/recordings/flight_2026-08-20_18-51-10.mkv
+data/recordings/flight_2026-08-20_18-54-29.mkv
+data/recordings/flight_2026-08-20_18-56-21.mkv
