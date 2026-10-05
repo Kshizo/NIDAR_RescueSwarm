@@ -1,0 +1,29 @@
+# flight-video-recorder.service
+#
+# Records the USB webcam from takeoff to landing (flight_video_recorder.py).
+# Follows the mission daemon's fc_telemetry.log, so it runs alongside
+# ardupilot-raster-mission.service and never touches the FC serial port.
+#
+# Install:
+#   sudo cp flight-video-recorder.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now flight-video-recorder
+
+[Unit]
+Description=Flight video recorder (records from takeoff to landing)
+After=ardupilot-raster-mission.service
+
+[Service]
+Type=simple
+User=aahswarm
+WorkingDirectory=/home/aahswarm/NIDAR_RescueSwarm/mission
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/aahswarm/px4_mavsdk_env/bin/python /home/aahswarm/NIDAR_RescueSwarm/mission/flight_video_recorder.py
+Restart=always
+RestartSec=3
+# SIGTERM lets ffmpeg finalize the file before exit.
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

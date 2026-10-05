@@ -32,13 +32,37 @@ pip install -r requirements.txt           # pymavlink, pyserial
 sudo apt install ffmpeg                   # only needed for video recording
 ```
 
-The launchers and systemd units use absolute paths under `/home/aahswarm/`.
-Edit them if you clone the project somewhere else.
+The launchers and systemd units expect the repository at
+`/home/aahswarm/NIDAR_RescueSwarm` and run everything from `mission/`. Edit
+`PROJECT_PATH` in `mission/start_*.sh` and the paths in `deploy/systemd/*.service`
+if you clone it somewhere else.
+
+## Project layout
+
+```
+NIDAR_RescueSwarm/
+├── mission/          Flight code that runs on the Pi. Kept in one folder because the
+│                     modules import each other and write their logs next to themselves.
+├── sim/              Simulated flight controller and the scenario test suite
+├── tests/            Offline planner and fixture tests (no FC, no simulator)
+├── tools/            Standalone bench utilities: link test, preflight, compass calibration
+├── deploy/systemd/   systemd units for the mission daemons and recorders
+├── docs/             Runbook, recorder guide, failure analyses, controller-design notes
+└── data/             Recorded flights, organised by type
+    ├── flight_logs/    raw MAVLink .tlog files and passive-recorder sessions
+    ├── telemetry/      verbose FC telemetry logs, named by the time range they cover
+    ├── mission_logs/   mission daemon logs, named by the time range they cover
+    ├── recordings/     onboard camera video (.mkv)
+    └── plans/          planner output (raster_preview.geojson)
+```
+
+Logs written by a running daemon land in `mission/` and are ignored by git.
+Copy the ones worth keeping into `data/`.
 
 ## Raster coverage mission
 
-`ardupilot_raster_mission.py` is the main mission. It reuses the base daemon
-(`ardupilot_horizontal_geofence_mission.py`) for connection, telemetry,
+`mission/ardupilot_raster_mission.py` is the main mission. It reuses the base daemon
+(`mission/ardupilot_horizontal_geofence_mission.py`) for connection, telemetry,
 takeoff, failsafes and landing, and replaces only the horizontal flight leg.
 
 1. Validate both polygons and build the raster path **before** connecting to the FC.
@@ -60,6 +84,7 @@ own failsafes are what remain.
 ### Preview a plan offline (no FC needed)
 
 ```bash
+cd mission
 python raster_plan_preview.py --spacing 1.0 --speed 0.5 \
   --corners 'latA,lonA;latB,lonB;latC,lonC;latD,lonD' \
   --outer   'latG1,lonG1;latG2,lonG2;latG3,lonG3;latG4,lonG4'
@@ -71,7 +96,7 @@ This writes `raster_preview.geojson`, which you can drop onto
 ### Run it
 
 ```bash
-sudo cp ardupilot-raster-mission.service /etc/systemd/system/
+sudo cp deploy/systemd/ardupilot-raster-mission.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl start ardupilot-raster-mission.service
 journalctl -fu ardupilot-raster-mission.service
@@ -82,14 +107,16 @@ switch into GUIDED**. Being in GUIDED already when the daemon starts does not
 launch it. To dry-run with telemetry only (no arm, mode or motion commands),
 set `RASTER_DRY_RUN=1`.
 
-Main settings, in `start_ardupilot_raster_mission.sh`:
+Main settings, in `mission/start_ardupilot_raster_mission.sh`:
 
 | Variable | Value | Meaning |
 | --- | --- | --- |
 | `RASTER_PASS_SPACING_M` | 1.0 | distance between passes |
-| `RASTER_SPEED_MPS` | 0.50 | pattern speed (limited by overshoot at pass ends) |
+| `RASTER_AXIS` | short | sweep along the short side of the polygon |
+| `RASTER_SPEED_MPS` | 1.00 | pattern speed (limited by overshoot at pass ends) |
 | `RASTER_TOTAL_TIMEOUT_S` | 650 | upper limit on total mission time |
-| `RASTER_ALT_MIN_M` / `MAX_M` | 1.5 / 2.5 | altitude band, abort outside |
+| `TAKEOFF_ALTITUDE_M` | 2.5 | hover and pattern altitude |
+| `RASTER_ALT_MIN_M` / `MAX_M` | 1.80 / 3.00 | altitude band, abort outside |
 | `RASTER_MIN_BATTERY_PERCENT` | 25 | companion battery floor |
 
 ## Pilot control (CH8 / Switch SC)
@@ -109,30 +136,39 @@ Runs the real mission code against `simulator.py` over loopback UDP. It never
 touches the serial port.
 
 ```bash
-./run_simulation.sh            # everything
-./run_simulation.sh raster     # 17 raster flight tests (breaches, stale telemetry, EKF, altitude, battery…)
-./run_simulation.sh dryrun     # dry-run tests; also checks that no flight command was sent
-./run_simulation.sh geometry   # fast offline polygon-refusal tests
+sim/run_simulation.sh            # everything
+sim/run_simulation.sh raster     # 17 raster flight tests (breaches, stale telemetry, EKF, altitude, battery…)
+sim/run_simulation.sh dryrun     # dry-run tests; also checks that no flight command was sent
+sim/run_simulation.sh geometry   # fast offline polygon-refusal tests
+```
+
+Offline tests, no simulator needed:
+
+```bash
+python tests/test_raster_entry_and_axis.py
+python tests/test_simulation_fixtures.py   # run after changing either polygon
 ```
 
 ## Files
 
 | File | Purpose |
 | --- | --- |
-| `ardupilot_raster_mission.py` | Polygon raster coverage mission (main) |
-| `ardupilot_horizontal_geofence_mission.py` | Base daemon: connection, telemetry, takeoff, failsafes, soft landing |
-| `ardupilot_3m_soft_bounce_mission.py` | Variant: fly out to a 3 m circle, bounce back, land |
-| `ardupilot_fly and land.py` | Earlier simple mission: take off, fly forward, land |
-| `raster_plan_preview.py` | Offline raster planner, standard library only (shared with the mission) |
-| `fc_telemetry_logger.py` | Verbose FC log hooked onto the mission's own connection |
-| `flight_recorder.py` | Passive recorder for manual flights (see `FLIGHT_RECORDER.md`) |
-| `preflight_check.py` | Read-only readiness check; exit 0 = ready |
-| `make_flight_ready.py` | Applies safe params, clears latched failsafes; never arms |
-| `compass_calibrate.py` | Onboard compass calibration over MAVLink |
-| `ardupilot_connection_test.py` | Quick link/telemetry diagnostic |
-| `video_recorder.py` | ffmpeg MJPEG capture with camera auto-discovery |
-| `simulator.py`, `run_simulation.sh` | Simulated FC and test scenarios |
-| `*.service`, `start_*.sh` | systemd units and launchers |
+| `mission/ardupilot_raster_mission.py` | Polygon raster coverage mission (main) |
+| `mission/ardupilot_horizontal_geofence_mission.py` | Base daemon: connection, telemetry, takeoff, failsafes, soft landing |
+| `mission/ardupilot_3m_soft_bounce_mission.py` | Variant: fly out to a 3 m circle, bounce back, land |
+| `mission/ardupilot_fly_and_land.py` | Earlier simple mission: take off, fly forward, land |
+| `mission/raster_plan_preview.py` | Offline raster planner, standard library only (shared with the mission) |
+| `mission/fc_telemetry_logger.py` | Verbose FC log hooked onto the mission's own connection |
+| `mission/flight_recorder.py` | Passive recorder for manual flights (see `docs/FLIGHT_RECORDER.md`) |
+| `tools/preflight_check.py` | Read-only readiness check; exit 0 = ready |
+| `tools/make_flight_ready.py` | Applies safe params, clears latched failsafes; never arms |
+| `tools/compass_calibrate.py` | Onboard compass calibration over MAVLink |
+| `tools/ardupilot_connection_test.py` | Quick link/telemetry diagnostic |
+| `mission/video_recorder.py` | ffmpeg MJPEG capture with camera auto-discovery |
+| `mission/flight_video_recorder.py` | Separate service that records video from takeoff to landing |
+| `mission/fc_status.py` | Read-only snapshot of the FC, the mission daemon and its live config (`--json` available) |
+| `sim/simulator.py`, `sim/run_simulation.sh` | Simulated FC and test scenarios |
+| `deploy/systemd/*.service`, `mission/start_*.sh` | systemd units and launchers |
 
 Only one process may own the FC serial link. The mission, preflight check,
 compass calibration and recorder share a lock file
@@ -140,6 +176,8 @@ compass calibration and recorder share a lock file
 
 ## Further reading
 
-- `KNOWN_GOOD_FLIGHT_RUNBOOK.md`: field procedure and step-by-step recovery
-- `FLIGHT_RECORDER.md`: recording manual diagnostic flights
-- `PROJECT_STATUS.txt`: hardware notes and the compass/EKF history
+- `docs/KNOWN_GOOD_FLIGHT_RUNBOOK.md`: field procedure and step-by-step recovery
+- `docs/FLIGHT_RECORDER.md`: recording manual diagnostic flights
+- `docs/PROJECT_STATUS.txt`: hardware notes and the compass/EKF history
+- `docs/WHY_THE_PATTERN_FAILED.md`: analysis of the 2026-09-15 raster flight and the fixes
+- `docs/LQR_JERK_SNAP_DATA_REQUIREMENTS.md`: data needed to add a jerk/snap-limited trajectory and LQR tracking

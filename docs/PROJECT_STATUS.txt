@@ -1,0 +1,194 @@
+ARDUPILOT COMPANION-COMPUTER DRONE PROJECT - CURRENT STATUS
+============================================================
+
+Last updated: 2026-09-09
+Status: SOFTWARE FLIGHT-READY - GROUNDED ON THE COMPASS FIELD READING (see BLOCKERS)
+
+
+PROJECT GOAL
+------------
+Companion-computer autonomous flight control on a Raspberry Pi 5, talking MAVLink
+directly to an ArduCopter flight controller.
+
+- Flight Controller: MicoAir743v2 (ArduCopter 4.6.3)
+- Companion Computer: Raspberry Pi 5 (Ubuntu 24.04 ARM64)
+- Radio / Receiver:   RadioMaster TX15 / ExpressLRS  -> NOT CURRENTLY DETECTED
+- GPS/GNSS:           3D fix, 13-19 sats, eph ~1.0 m
+- Camera:             Microsoft LifeCam HD-3000      -> NOT CURRENTLY CONNECTED
+- Protocol:           pymavlink (ardupilotmega dialect) over USB serial
+
+NOTE: this project no longer uses PX4 or MAVSDK. Earlier revisions did, and the
+old px4_*.py files and the mavsdk/grpcio/protobuf dependencies have been removed.
+There is no Offboard mode here - ArduCopter GUIDED mode is used instead.
+
+
+CURRENT BLOCKERS
+----------------
+B1. COMPASS 1 READS A FIELD 35% TOO WEAK
+    "PreArm: Check mag field (xy diff:143>100)".
+
+    A valid calibration IS stored on compass 1 - offsets (-115.6, +35.4, +106.1)
+    plus a real ellipsoid fit (diagonals 1.008/1.021/1.048, non-zero off-diagonals).
+    The stored calibration is not the problem. What it MEASURES is:
+
+        compass 1 (external, COMPASS_USE=1, in use):  total field 265 mGauss
+        compass 2 (internal, COMPASS_USE2=0, off):    total field 408 mGauss
+        expected at 13.346N, 74.794E:                 ~410 mGauss
+
+    Field magnitude does not depend on aircraft orientation, so these are directly
+    comparable. Compass 2 is right; compass 1 is ~145 mGauss low, which is exactly
+    the xy diff the pre-arm reports.
+
+    Two candidates, cheap to tell apart: measure again OUTDOORS in the open, away
+    from cars/rebar/steel. If compass 1 still reads ~265 there, the calibration is
+    stale and needs redoing - or enable compass 2 (COMPASS_USE2=1), which is
+    currently switched off and reading correctly.
+
+    Downstream of B1: EKF reports flags=167 (CONST_POS_MODE) with no horizontal
+    position, so no home point is set and GUIDED cannot hold position.
+    EK3_SRC1_YAW=1 means yaw comes from the compass. Fixing the compass is
+    expected to clear all of this.
+
+B2. NO FLIGHT BATTERY CONNECTED
+    SYS_STATUS reports 0.00 V - the aircraft is on USB power only. The FC will not
+    arm below BATT_ARM_VOLT (14.8 V), and the motors cannot run on USB regardless.
+
+NOT a blocker any more - RC RECEIVER
+    RC_CHANNELS still reports chancount=0 because the transmitter is switched off
+    on the bench. This is expected and is now a WARNING, not a blocker, in both
+    preflight_check.py and make_flight_ready.py: the TX is switched on at the field
+    immediately before flight, and CH8 is used to select the autonomous mode.
+    Nothing is bypassed by this - ArduPilot still enforces it itself with
+    "PreArm: RC not found" and will not arm until the receiver is genuinely live.
+    The flight controller side is configured correctly and must NOT be changed:
+        SERIAL1_PROTOCOL = 23 (RCIN),  RC_PROTOCOLS = 1 (all)
+
+Run `python preflight_check.py` to re-test.
+
+
+ARCHITECTURE
+------------
+1. Continuous background daemon (systemd: ardupilot-mission.service)
+   - Starts on boot, runs an infinite supervisor loop, never exits after a flight.
+   - Auto-discovers the flight controller via /dev/serial/by-id/ (the ttyACM
+     number changes on every power cycle, so it is never hardcoded).
+   - Holds an exclusive flock so a second instance can never share the serial link.
+   - Recovers automatically from flight controller disconnects and battery swaps.
+
+2. Mission triggers, in order of precedence
+   a. CH8 moved into the GUIDED band - only when a receiver is actually present.
+   b. Creation of the trigger file (works headless, with no receiver):
+          touch /home/aahswarm/ardupilot_testing/START_MISSION
+      The file is consumed, so one trigger runs exactly one mission.
+   c. AUTOSTART_WITHOUT_RC=1 - fires once per connection. Off by default,
+      because it arms the aircraft unattended.
+   A cooldown separates attempts so a failed mission cannot retry in a loop.
+
+3. Autonomous ground mission
+   GUIDED -> arm -> takeoff to 1.2 m AGL -> hover 2 s -> forward 0.3 m/s for 5 s
+   -> hover 3 s -> multi-phase soft landing (0.15 m/s descent, 0.08 m/s cushion
+   crawl below 0.40 m) -> touchdown -> disarm -> LOITER -> back to STANDBY.
+
+4. Altitude handling
+   Height is measured as AGL above the takeoff point: a single prioritised source
+   (GLOBAL_POSITION_INT, falling back to LOCAL_POSITION_NED) with a ground
+   baseline latched at the moment of arming. Do not reintroduce writes to
+   relative_altitude_m from multiple messages - they disagree by metres.
+
+5. Safety behaviour
+   - Pilot takeover: CH8 to MANUAL drops companion control immediately.
+   - CH8 to LAND commands a soft LAND.
+   - Loss of an RC link that was present aborts the mission and lands.
+   - No geofence. Containment is the pilot's job: if the aircraft drifts out of
+     the test area, take manual control on the transmitter.
+   - A takeoff that produces no climb within 8 s is reported as NO LIFTOFF and
+     the aircraft is disarmed rather than left armed with spinning props.
+   - The daemon never disarms while airborne.
+
+
+CONFIGURATION (environment variables)
+-------------------------------------
+ARDUPILOT_CONNECTION  empty = auto-discover; or a device path, or udp:host:port
+ARDUPILOT_BAUD        default 115200
+TAKEOFF_ALTITUDE_M    default 1.2
+FORWARD_SPEED_MPS     default 0.3        FORWARD_DURATION_S   default 5.0
+DESCENT_SPEED_MPS     default 0.15       TOUCHDOWN_SPEED_MPS  default 0.08
+MISSION_TRIGGER_FILE  default <project>/START_MISSION
+AUTOSTART_WITHOUT_RC  default 0          MISSION_COOLDOWN_S   default 20
+CONFIGURE_FENCE       default 0 (fence off; =1 restores it)
+                                         FENCE_RADIUS_M  15   FENCE_ALT_MAX_M  5
+NO_CLIMB_TIMEOUT_S    default 8
+CAMERA_DEVICE         empty = auto-discover via /dev/v4l/by-id/
+LOG_FILE              default <project>/ardupilot_mission.log
+BENCH_MODE            default 0  - see the warning below
+
+BENCH_MODE=1 sets ARMING_CHECK=0, disabling every ArduPilot pre-arm check so a
+bench rig with no battery monitor and no RC can be armed. ONLY with propellers
+removed. Never for a real flight. Leaving it off keeps ARMING_CHECK=1.
+
+
+FLIGHT CONTROLLER PARAMETERS SET BY THE DAEMON
+----------------------------------------------
+LAND_SPEED=20 cm/s, LAND_ALT_LOW=150 cm, BATT_FS_LOW_ACT=1, BATT_FS_CRT_ACT=1,
+FENCE_ENABLE=0 (no geofence), FS_THR_ENABLE=3, FS_GCS_ENABLE=5, ARMING_CHECK=1.
+With CONFIGURE_FENCE=1 it also writes FENCE_TYPE=3, FENCE_ALT_MAX, FENCE_RADIUS,
+FENCE_MARGIN (clamped below the radius) and FENCE_ACTION=2 (always land).
+
+FS_THR_ENABLE=3 (Land on RC loss), changed from 1 (RTL). The default sent the
+aircraft to RTL_ALT - 15 m - and back home on any RC glitch, which is both absurd
+for a 1.2 m hover test and the opposite of handing control back to the pilot.
+
+FS_GCS_ENABLE=5 (Land), resolving the previously open decision. If the Pi dies
+mid-flight the aircraft now lands instead of holding in GUIDED indefinitely. The
+old objection - that it would also auto-land during manual RC flight - does not
+apply, because FS_OPTIONS=16 ("continue in pilot-controlled modes on GCS
+failsafe") is set, so it cannot fire while the pilot is flying on the sticks.
+The daemon sends the required 1 Hz heartbeat (gcs_heartbeat_loop) as sysid 255,
+which matches SYSID_MYGCS=255. If either of those ever changes, the GCS failsafe
+stops seeing the heartbeats and will fire in flight.
+
+Not set by the daemon, worth knowing:
+  FS_EKF_ACTION=1 (Land), FS_CRASH_CHECK=1, FS_VIBE_ENABLE=1, RTL_ALT=1500 cm.
+  BATT_LOW_VOLT=15.2 V is 3.8 V/cell on 4S - high enough that a half-charged pack
+  can sag into an early auto-Land. Fine on a fresh pack for a short flight;
+  lower it to ~14.4 V otherwise.
+
+
+FILES
+-----
+ardupilot_mission.py        Continuous autonomous flight daemon.
+preflight_check.py          Read-only readiness check. Arms nothing. Exit 0 = ready.
+ardupilot_connection_test.py Quick link/telemetry diagnostic.
+video_recorder.py           FFmpeg MJPEG capture, zero re-encode, camera auto-discovery.
+start_ardupilot_mission.sh  Launcher (activates the venv).
+ardupilot-mission.service   systemd unit.
+recordings/                 Flight video output (.mkv).
+ardupilot_mission.log       Rotating mission log.
+
+Only one process may hold the serial link. preflight_check.py and the daemon use
+the same lock and will refuse to run together rather than corrupt the telemetry.
+
+
+PYTHON ENVIRONMENT
+------------------
+Virtual environment: /home/aahswarm/px4_mavsdk_env   (name is historical)
+Python 3.12.3
+Dependencies: pymavlink==2.4.49, pyserial==3.5   (see requirements.txt)
+Also required on the system: ffmpeg
+
+
+PRE-FLIGHT CHECKLIST
+--------------------
+1. Outdoors, in the open. Connect the flight battery (B2). Switch the transmitter
+   on and confirm CH8 moves. Then resolve the compass field reading (B1).
+2. python preflight_check.py  ->  must print READY TO FLY.
+3. Bench test with PROPELLERS REMOVED:
+       BENCH_MODE=1 AUTOSTART_WITHOUT_RC=1 python ardupilot_mission.py
+   Confirm arming and motor spin-up, then stop it.
+4. Confirm the transmitter is on and CH8 override works before fitting props.
+5. Open area, props on, transmitter in hand. Start the service, then:
+       touch /home/aahswarm/ardupilot_testing/START_MISSION
+
+
+END OF CURRENT PROJECT STATUS
+=============================
