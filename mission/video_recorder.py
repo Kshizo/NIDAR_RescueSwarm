@@ -7,6 +7,7 @@ import signal
 import shutil
 import atexit
 import tempfile
+import json
 
 logger = logging.getLogger("video_recorder")
 logger.setLevel(logging.INFO)
@@ -131,7 +132,8 @@ def start_recording():
 
     try:
         _ffmpeg_err_file = tempfile.TemporaryFile(mode="w+")
-        
+
+        start_wall = time.time()
         _ffmpeg_process = subprocess.Popen(
             ffmpeg_cmd,
             stdin=subprocess.PIPE,
@@ -150,6 +152,7 @@ def start_recording():
             raise RuntimeError(f"FFmpeg process terminated unexpectedly on startup. Stderr:\n{stderr_output}")
 
         logger.info(f"Started recording video to: {_current_file_path} (camera: {device})")
+        _write_start_sidecar(_current_file_path, start_wall)
         return _ffmpeg_process, _current_file_path
 
     except Exception as e:
@@ -160,6 +163,24 @@ def start_recording():
             _ffmpeg_err_file.close()
             _ffmpeg_err_file = None
         raise
+
+
+def _write_start_sidecar(video_path, start_wall):
+    """Write flight_<ts>.json next to the video with the millisecond start time.
+
+    The filename only has 1 s resolution; vision/detect_cones_video.py uses this
+    to line frames up with the telemetry log. Never allowed to break recording.
+    """
+    try:
+        with open(os.path.splitext(video_path)[0] + ".json", "w") as f:
+            json.dump({
+                "video": os.path.basename(video_path),
+                "start_epoch": round(start_wall, 3),
+                "start_local": datetime.datetime.fromtimestamp(start_wall).isoformat(
+                    timespec="milliseconds"),
+            }, f)
+    except Exception as e:
+        logger.warning(f"Could not write video start-time sidecar: {e}")
 
 
 def stop_recording():

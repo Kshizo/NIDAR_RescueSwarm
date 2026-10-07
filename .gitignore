@@ -21,3 +21,6 @@ data/recordings/flight_2026-08-20_18-48-26.mkv
 data/recordings/flight_2026-08-20_18-51-10.mkv
 data/recordings/flight_2026-08-20_18-54-29.mkv
 data/recordings/flight_2026-08-20_18-56-21.mkv
+
+# Cone detection output written next to the analysed video
+*_cones/
