@@ -46,6 +46,7 @@ NIDAR_RescueSwarm/
 ├── sim/              Simulated flight controller and the scenario test suite
 ├── tests/            Offline planner and fixture tests (no FC, no simulator)
 ├── tools/            Standalone bench utilities: link test, preflight, compass calibration
+├── vision/           Post-flight cone detection + geotagging on the onboard video (OpenCV)
 ├── deploy/systemd/   systemd units for the mission daemons and recorders
 ├── docs/             Runbook, recorder guide, failure analyses, controller-design notes
 └── data/             Recorded flights, organised by type
@@ -119,6 +120,24 @@ Main settings, in `mission/start_ardupilot_raster_mission.sh`:
 | `RASTER_ALT_MIN_M` / `MAX_M` | 1.80 / 3.00 | altitude band, abort outside |
 | `RASTER_MIN_BATTERY_PERCENT` | 25 | companion battery floor |
 
+## Post-flight cone detection
+
+`vision/` finds red, yellow and green cones in a downward-camera recording with
+HSV colour thresholds (no ML), tracks them across frames, and geotags each one
+from the FC telemetry log of the same flight. Cones seen again on a later raster
+pass are merged. It runs after landing, on the laptop or the Pi:
+
+```bash
+pip install -r vision/requirements.txt
+cd vision
+python detect_cones_video.py ../data/recordings/flight_<ts>.mkv \
+  --telemetry ../data/telemetry/fc_telemetry_<range>.log
+```
+
+Output goes to `flight_<ts>_cones/`; `cones.geojson` can go straight onto
+[geojson.io](https://geojson.io). See `vision/README.md` for the camera
+assumptions and the field checklist (time sync and camera orientation matter most).
+
 ## Pilot control (CH8 / Switch SC)
 
 | CH8 PWM | Mode |
@@ -147,6 +166,7 @@ Offline tests, no simulator needed:
 ```bash
 python tests/test_raster_entry_and_axis.py
 python tests/test_simulation_fixtures.py   # run after changing either polygon
+python tests/test_cone_detection.py        # vision/ (needs vision/requirements.txt)
 ```
 
 ## Files
@@ -164,11 +184,12 @@ python tests/test_simulation_fixtures.py   # run after changing either polygon
 | `tools/make_flight_ready.py` | Applies safe params, clears latched failsafes; never arms |
 | `tools/compass_calibrate.py` | Onboard compass calibration over MAVLink |
 | `tools/ardupilot_connection_test.py` | Quick link/telemetry diagnostic |
-| `mission/video_recorder.py` | ffmpeg MJPEG capture with camera auto-discovery |
+| `mission/video_recorder.py` | ffmpeg MJPEG capture with camera auto-discovery; writes a `.json` start-time sidecar |
 | `mission/flight_video_recorder.py` | Separate service that records video from takeoff to landing |
 | `mission/fc_status.py` | Read-only snapshot of the FC, the mission daemon and its live config (`--json` available) |
 | `sim/simulator.py`, `sim/run_simulation.sh` | Simulated FC and test scenarios |
 | `deploy/systemd/*.service`, `mission/start_*.sh` | systemd units and launchers |
+| `vision/detect_cones_video.py` | Post-flight cone detection, tracking and geotagging (see `vision/README.md`) |
 
 Only one process may own the FC serial link. The mission, preflight check,
 compass calibration and recorder share a lock file
