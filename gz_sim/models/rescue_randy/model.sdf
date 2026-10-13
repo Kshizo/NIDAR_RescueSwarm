@@ -1,0 +1,26 @@
+<?xml version="1.0" ?>
+<sdf version="1.9">
+  <model name="rescue_randy">
+    <static>true</static>
+    <link name="link">
+      <collision name="collision">
+        <geometry><mesh><uri>model://rescue_randy/meshes/rescue_randy.dae</uri></mesh></geometry>
+      </collision>
+      <visual name="visual">
+        <geometry><mesh><uri>model://rescue_randy/meshes/rescue_randy.dae</uri></mesh></geometry>
+        <material>
+          <diffuse>1.0 1.0 1.0</diffuse>
+          <specular>1.0 1.0 1.0</specular>
+          <pbr>
+            <metal>
+              <albedo_map>model://rescue_randy/materials/textures/rescue_randy_albedo.png</albedo_map>
+              <normal_map>model://rescue_randy/materials/textures/rescue_randy_normal.png</normal_map>
+              <metalness_map>model://rescue_randy/materials/textures/rescue_randy_metalness.png</metalness_map>
+              <roughness_map>model://rescue_randy/materials/textures/rescue_randy_roughness.png</roughness_map>
+            </metal>
+          </pbr>
+        </material>
+      </visual>
+    </link>
+  </model>
+</sdf>
