@@ -1,0 +1,28 @@
+# NIDAR RescueSwarm SITL airframe: Iris X-quad driven by Gazebo over the JSON interface.
+# Loaded on top of ArduCopter defaults by launch_sim.sh (one copy per instance; SYSID set by --sysid).
+FRAME_CLASS     1
+FRAME_TYPE      1
+MOT_PWM_MIN     1100
+MOT_PWM_MAX     1900
+
+# Downward 1-D lidar. Type 100 = SITL: reads rng_1 from the Gazebo ArduPilot plugin,
+# which subscribes to /nidar/drone<i>/lidar. Orientation 25 = pointing down.
+RNGFND1_TYPE    100
+RNGFND1_ORIENT  25
+RNGFND1_MIN     0.10
+RNGFND1_MAX     40.0
+RNGFND1_GNDCLR  0.20
+RNGFND1_SCALING 1
+
+# Companion computer flies GUIDED with velocity setpoints at 10 Hz.
+GUID_TIMEOUT    3
+WPNAV_SPEED     800
+WPNAV_ACCEL     250
+ANGLE_MAX       3000
+
+# No RC transmitter or GCS in this sim; the companion is the only controller.
+FS_THR_ENABLE   0
+FS_GCS_ENABLE   0
+ARMING_CHECK    1
+LOG_DISARMED    0
+SIM_SPEEDUP     1
